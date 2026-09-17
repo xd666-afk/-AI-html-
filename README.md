@@ -21,7 +21,6 @@
 1. 装好 Python 3.8+（建议 3.10 以上）
 2. 安装依赖：
 
-```bash
 pip install -r requirements.txt
 
 ## 使用
