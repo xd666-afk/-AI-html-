@@ -1,0 +1,11 @@
+{
+  "api_key": "",
+  "input": "",
+  "output": "",
+  "src_lang": "auto",
+  "dst_lang": "zh-CN",
+  "skip_existing": true,
+  "batch_size": 30,
+  "workers": 12,
+  "glossary": ""
+}
