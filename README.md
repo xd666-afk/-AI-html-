@@ -23,3 +23,13 @@
 
 ```bash
 pip install -r requirements.txt
+
+## 使用
+
+1. 在项目文件夹里新建 `input` 文件夹，把要翻译的 HTML 放进去
+2. 运行 `GUI文件.py`
+3. 填入你的 DeepSeek API Key（去 https://platform.deepseek.com 申请）
+4. 选择源语言和目标语言，点「全部翻译」
+5. 译文会输出到 `output` 文件夹
+
+> 注意：`GUI文件.py` 和 `translate_html.py` 必须在同一文件夹内。
