@@ -1,425 +1,589 @@
 # -*- coding: utf-8 -*-
 """
-HTML 批量翻译核心引擎（DeepSeek API）
+GUI文件.py —— DeepSeek API 批量翻译 HTML（tkinter 桌面版）
+与 translate_html.py 必须放在同一目录下。
 
-功能概览：
-- 遍历目录下 .html/.htm，用 BeautifulSoup 提取文本节点与可翻译属性
-- 跳过 script/style/pre/code 等标签
-- 跳过无源语言字符、过短、纯数字符号的片段（省钱）
-- 批内去重：同一批里重复文本只发一次 API
-- 结果缓存：cache/ 目录按 md5 存，命中不花钱
-- 多线程并发翻译
-- 回写阶段按文件刷新进度条 0→100%
-
-对外主入口：
-    run_translation(input_dir, output_dir, api_key, ...)
+功能：
+- 批量翻译整个 input 目录
+- 左侧文件列表，双击某个文件可"只翻译这一个"（弹窗确认）
+- 双进度条（文件级 + 片段级）
+- 术语表、语言选择、缓存、批大小/并发数
 """
 
 import os
-import re
+import sys
 import json
-import time
-import hashlib
+import shutil
+import queue
+import tempfile
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
 
-from bs4 import BeautifulSoup
-from openai import OpenAI
-
-# ---------------- 可调常量 ----------------
-DEFAULT_BATCH = 30          # 每批片段数
-DEFAULT_WORKERS = 6         # 并发线程
-MIN_FRAGMENT_LEN = 2        # 短于这个长度直接跳过，不发 API
-
-SKIP_TAGS = {"script", "style", "pre", "code", "noscript", "svg", "math"}
-TRANSLATE_ATTRS = ("alt", "title", "placeholder", "aria-label")
-
-CACHE_DIR = "cache"
-
-# ---------------- 语言表 ----------------
-# 值格式：(提示词里用的名字, 用于字符检测的脚本名元组)
-LANGUAGES = {
-    "俄语":       ("俄语",       ("cyrillic",)),
-    "英语":       ("英语",       ("latin",)),
-    "简体中文":   ("简体中文",   ("cjk",)),
-    "繁体中文":   ("繁体中文",   ("cjk",)),
-    "日语":       ("日语",       ("cjk", "kana")),
-    "韩语":       ("韩语",       ("hangul",)),
-    "德语":       ("德语",       ("latin",)),
-    "法语":       ("法语",       ("latin",)),
-    "西班牙语":   ("西班牙语",   ("latin",)),
-    "葡萄牙语":   ("葡萄牙语",   ("latin",)),
-    "意大利语":   ("意大利语",   ("latin",)),
-    "阿拉伯语":   ("阿拉伯语",   ("arabic",)),
-    "泰语":       ("泰语",       ("thai",)),
-    "越南语":     ("越南语",     ("latin",)),
-}
-
-_CHAR_RANGES = {
-    "cyrillic": [(0x0400, 0x04FF), (0x0500, 0x052F)],
-    "latin":    [(0x0041, 0x005A), (0x0061, 0x007A),
-                 (0x00C0, 0x024F)],
-    "cjk":      [(0x4E00, 0x9FFF), (0x3400, 0x4DBF)],
-    "kana":     [(0x3040, 0x309F), (0x30A0, 0x30FF)],
-    "hangul":   [(0xAC00, 0xD7AF), (0x1100, 0x11FF)],
-    "arabic":   [(0x0600, 0x06FF), (0x0750, 0x077F)],
-    "thai":     [(0x0E00, 0x0E7F)],
-}
-
-# ---------------- 全局统计 ----------------
-STATS = {
-    "cache_hit": 0,
-    "api_call": 0,
-    "saved_chars": 0,
-    "translated_chars": 0,
-}
-_stats_lock = threading.Lock()
+# 保证可以从同目录导入核心模块
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import translate_html as th
 
 
-# ---------------- 工具函数 ----------------
-def _md5(s: str) -> str:
-    return hashlib.md5(s.encode("utf-8")).hexdigest()
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gui_config.json")
+
+# 颜色 / 状态
+COLOR_DOING_BG = "#D6E9FF"
+COLOR_DOING_FG = "#0B4C9E"
+COLOR_DONE_FG  = "#888888"
+COLOR_FAIL_FG  = "#C0392B"
+COLOR_SKIP_FG  = "#AAAAAA"
 
 
-def _in_ranges(ch: str, ranges) -> bool:
-    o = ord(ch)
-    for lo, hi in ranges:
-        if lo <= o <= hi:
-            return True
-    return False
+class App:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("HTML 批量翻译（DeepSeek）")
+        self.root.geometry("1060x660")
 
+        # 状态
+        self.worker = None
+        self.stop_flag = threading.Event()
+        self.msg_q = queue.Queue()
+        self.fname_to_idx = {}   # 文件名 -> Listbox 行号
+        self.files = []          # 当前列表中的文件名（顺序）
+        self.single_mode = False # 是否单文件模式
+        self.single_target = None  # 单文件模式下正在翻的原文件名（用于显示）
 
-def _has_script(text: str, scripts) -> bool:
-    for ch in text:
-        for sc in scripts:
-            if _in_ranges(ch, _CHAR_RANGES.get(sc, [])):
-                return True
-    return False
+        # 变量
+        base = os.path.dirname(os.path.abspath(__file__))
+        self.var_in  = tk.StringVar(value=os.path.join(base, "input"))
+        self.var_out = tk.StringVar(value=os.path.join(base, "output"))
+        self.var_cache = tk.StringVar(value=os.path.join(base, "cache"))
+        self.var_api = tk.StringVar(value="")
+        self.var_src = tk.StringVar(value="英语")
+        self.var_dst = tk.StringVar(value="简体中文")
+        self.var_glossary = tk.StringVar(value="")
+        self.var_batch = tk.StringVar(value=str(th.DEFAULT_BATCH))
+        self.var_workers = tk.StringVar(value=str(th.DEFAULT_WORKERS))
+        self.var_file = tk.DoubleVar(value=0.0)
+        self.var_frag = tk.DoubleVar(value=0.0)
+        self.var_status = tk.StringVar(value="就绪")
 
+        self._load_config()
+        self._build_ui()
+        self._refresh_file_list()
+        self.root.after(120, self._poll_queue)
 
-def _should_skip(text: str, src_scripts) -> bool:
-    """是否跳过这个片段（不发 API）"""
-    t = text.strip()
-    if len(t) < MIN_FRAGMENT_LEN:
-        return True
-    # 纯数字/标点/空白
-    if not re.search(r"[A-Za-z\u00C0-\u024F\u0400-\u04FF\u4E00-\u9FFF"
-                     r"\u3040-\u30FF\uAC00-\uD7AF\u0600-\u06FF\u0E00-\u0E7F]", t):
-        return True
-    # 没有源语言字符
-    if src_scripts and not _has_script(t, src_scripts):
-        return True
-    return False
+    # ---------- UI ----------
+    def _build_ui(self):
+        pad = {"padx": 6, "pady": 4}
 
+        main = ttk.Frame(self.root)
+        main.pack(fill="both", expand=True, padx=8, pady=6)
 
-def _system_prompt(src_lang: str, dst_lang: str) -> str:
-    return (
-        f"你是专业的网页本地化翻译。把用户给的 HTML 文本片段从「{src_lang}」"
-        f"翻译成「{dst_lang}」。\n"
-        "要求：\n"
-        "1. 只输出译文本身，不要解释、不要引号、不要 Markdown。\n"
-        "2. 严格保持与输入相同的行数，一行输入对应一行输出。\n"
-        "3. 保留原文中的 HTML 实体、变量占位符（如 {0}、%s、{{name}}）不变。\n"
-        "4. 保留原有的首尾空白与标点风格。\n"
-        "5. 如果某行是地名/品牌/网址等专有名词，可保留原文。"
-    )
+        # 左：文件列表
+        left = ttk.LabelFrame(main, text="待翻译文件 (input) —— 双击可单独翻译")
+        left.pack(side="left", fill="both", expand=False, padx=(0, 8))
 
+        header = ttk.Frame(left)
+        header.pack(fill="x", padx=6, pady=(4, 2))
+        self.lb_count = ttk.Label(header, text="(0)")
+        self.lb_count.pack(side="left")
+        ttk.Button(header, text="刷新", width=6, command=self._refresh_file_list).pack(side="right")
 
-def _cache_path(key: str) -> str:
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    return os.path.join(CACHE_DIR, key + ".json")
+        lb_wrap = ttk.Frame(left)
+        lb_wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        sb = ttk.Scrollbar(lb_wrap, orient="vertical")
+        self.lb = tk.Listbox(lb_wrap, width=36, height=30, activestyle="none",
+                             yscrollcommand=sb.set)
+        sb.config(command=self.lb.yview)
+        sb.pack(side="right", fill="y")
+        self.lb.pack(side="left", fill="both", expand=True)
 
+        # 双击 = 只翻这个文件
+        self.lb.bind("<Double-Button-1>", self._on_double_click)
 
-def _cache_get(key: str):
-    p = _cache_path(key)
-    if os.path.exists(p):
-        try:
-            with open(p, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return None
-    return None
+        # 右：配置 + 日志
+        right = ttk.Frame(main)
+        right.pack(side="left", fill="both", expand=True)
 
+        # ----- 配置区 -----
+        cfg = ttk.LabelFrame(right, text="配置")
+        cfg.pack(fill="x")
+        cfg.columnconfigure(1, weight=1)
 
-def _cache_set(key: str, value):
-    p = _cache_path(key)
-    try:
-        with open(p, "w", encoding="utf-8") as f:
-            json.dump(value, f, ensure_ascii=False)
-    except Exception:
-        pass
+        r = 0
+        ttk.Label(cfg, text="输入目录").grid(row=r, column=0, sticky="w", **pad)
+        ttk.Entry(cfg, textvariable=self.var_in).grid(row=r, column=1, sticky="ew", **pad)
+        ttk.Button(cfg, text="选择", width=6,
+                   command=lambda: self._choose_dir(self.var_in)).grid(row=r, column=2, **pad)
 
+        r += 1
+        ttk.Label(cfg, text="输出目录").grid(row=r, column=0, sticky="w", **pad)
+        ttk.Entry(cfg, textvariable=self.var_out).grid(row=r, column=1, sticky="ew", **pad)
+        ttk.Button(cfg, text="选择", width=6,
+                   command=lambda: self._choose_dir(self.var_out)).grid(row=r, column=2, **pad)
 
-# ---------------- API 调用 ----------------
-def _translate_uniq(client, uniq_texts, src_lang, dst_lang, model, src_scripts):
-    """
-    翻译一批去重后的文本。返回 dict: 原文 -> 译文
-    分段数不符时递归对半拆。
-    """
-    result = {}
-    if not uniq_texts:
-        return result
+        r += 1
+        ttk.Label(cfg, text="缓存目录").grid(row=r, column=0, sticky="w", **pad)
+        ttk.Entry(cfg, textvariable=self.var_cache).grid(row=r, column=1, sticky="ew", **pad)
+        ttk.Button(cfg, text="选择", width=6,
+                   command=lambda: self._choose_dir(self.var_cache)).grid(row=r, column=2, **pad)
 
-    # 先查缓存
-    todo = []
-    for t in uniq_texts:
-        key = _md5(f"{src_lang}|{dst_lang}|{model}|{t}")
-        cached = _cache_get(key)
-        if cached is not None:
-            result[t] = cached
-            with _stats_lock:
-                STATS["cache_hit"] += 1
-                STATS["saved_chars"] += len(t)
-        else:
-            todo.append((t, key))
+        r += 1
+        ttk.Label(cfg, text="API Key").grid(row=r, column=0, sticky="w", **pad)
+        ttk.Entry(cfg, textvariable=self.var_api, show="*").grid(row=r, column=1, sticky="ew", **pad)
+        ttk.Button(cfg, text="保存配置", width=8, command=self._save_config).grid(row=r, column=2, **pad)
 
-    if not todo:
-        return result
+        r += 1
+        ttk.Label(cfg, text="源语言").grid(row=r, column=0, sticky="w", **pad)
+        lang_values = list(th.LANGUAGES.keys())
+        self.cb_src = ttk.Combobox(cfg, textvariable=self.var_src, values=lang_values,
+                                   state="readonly", width=18)
+        self.cb_src.grid(row=r, column=1, sticky="w", **pad)
 
-    # 组装多行文本
-    lines = [t for t, _ in todo]
-    payload = "\n".join(lines)
+        ttk.Label(cfg, text="目标语言").grid(row=r, column=2, sticky="w", **pad)
+        self.cb_dst = ttk.Combobox(cfg, textvariable=self.var_dst, values=lang_values,
+                                   state="readonly", width=18)
+        self.cb_dst.grid(row=r, column=3, sticky="w", **pad)
 
-    try:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": _system_prompt(src_lang, dst_lang)},
-                {"role": "user", "content": payload},
-            ],
-            temperature=1.3,
-        )
-        out = resp.choices[0].message.content or ""
-    except Exception as e:
-        # API 失败：兜底返回原文，不写缓存（避免污染）
-        for t, _ in todo:
-            result[t] = t
-        raise e
+        r += 1
+        ttk.Label(cfg, text="术语表").grid(row=r, column=0, sticky="w", **pad)
+        ttk.Entry(cfg, textvariable=self.var_glossary).grid(row=r, column=1, sticky="ew", **pad)
+        ttk.Button(cfg, text="选择", width=6,
+                   command=self._choose_file).grid(row=r, column=2, **pad)
 
-    out_lines = out.split("\n")
+        r += 1
+        ttk.Label(cfg, text="批大小").grid(row=r, column=0, sticky="w", **pad)
+        ttk.Entry(cfg, textvariable=self.var_batch, width=8).grid(row=r, column=1, sticky="w", **pad)
+        ttk.Label(cfg, text="并发数").grid(row=r, column=2, sticky="w", **pad)
+        ttk.Entry(cfg, textvariable=self.var_workers, width=8).grid(row=r, column=3, sticky="w", **pad)
 
-    # 行数匹配
-    if len(out_lines) == len(lines):
-        for (t, key), tr in zip(todo, out_lines):
-            result[t] = tr
-            _cache_set(key, tr)
-            with _stats_lock:
-                STATS["api_call"] += 1
-                STATS["translated_chars"] += len(t)
-    else:
-        # 对半拆，递归
-        if len(lines) == 1:
-            # 单条还错，兜底原文，不写缓存
-            t, _ = todo[0]
-            result[t] = t
-        else:
-            mid = len(todo) // 2
-            left = todo[:mid]
-            right = todo[mid:]
-            result.update(_translate_uniq(
-                client, [t for t, _ in left], src_lang, dst_lang, model, src_scripts))
-            result.update(_translate_uniq(
-                client, [t for t, _ in right], src_lang, dst_lang, model, src_scripts))
+        # ----- 按钮 -----
+        bar = ttk.Frame(right)
+        bar.pack(fill="x", pady=(6, 4))
+        self.btn_start = ttk.Button(bar, text="开始翻译（全部）", command=self._start_all)
+        self.btn_start.pack(side="left", padx=4)
+        self.btn_stop = ttk.Button(bar, text="停止", command=self._stop, state="disabled")
+        self.btn_stop.pack(side="left", padx=4)
+        ttk.Button(bar, text="打开输出目录", command=self._open_output).pack(side="left", padx=4)
 
-    return result
+        # ----- 双进度条 -----
+        prog = ttk.LabelFrame(right, text="进度")
+        prog.pack(fill="x", pady=(0, 4))
+        ttk.Label(prog, text="文件").grid(row=0, column=0, sticky="w", padx=6, pady=2)
+        ttk.Progressbar(prog, variable=self.var_file, maximum=100.0).grid(
+            row=0, column=1, sticky="ew", padx=6, pady=2)
+        ttk.Label(prog, text="片段").grid(row=1, column=0, sticky="w", padx=6, pady=2)
+        ttk.Progressbar(prog, variable=self.var_frag, maximum=100.0).grid(
+            row=1, column=1, sticky="ew", padx=6, pady=2)
+        prog.columnconfigure(1, weight=1)
+        ttk.Label(prog, textvariable=self.var_status).grid(
+            row=2, column=0, columnspan=2, sticky="w", padx=6, pady=(2, 4))
 
+        # ----- 日志 -----
+        logf = ttk.LabelFrame(right, text="日志")
+        logf.pack(fill="both", expand=True)
+        self.txt = tk.Text(logf, height=12, wrap="word", state="disabled")
+        lsb = ttk.Scrollbar(logf, orient="vertical", command=self.txt.yview)
+        self.txt.configure(yscrollcommand=lsb.set)
+        lsb.pack(side="right", fill="y")
+        self.txt.pack(side="left", fill="both", expand=True)
 
-def _translate_batch(client, texts, src_lang, dst_lang, model, src_scripts):
-    """批内去重后翻译。返回 dict: 原文 -> 译文"""
-    uniq = list(dict.fromkeys(texts))
-    mapping = _translate_uniq(client, uniq, src_lang, dst_lang, model, src_scripts)
-    return {t: mapping.get(t, t) for t in texts}
+        self._log("就绪。填好 API Key，点【开始翻译（全部）】批量翻，")
+        self._log("或在左侧列表【双击】某个文件，只翻这一个。")
 
+    # ---------- 文件列表 ----------
+    def _refresh_file_list(self):
+        self.lb.delete(0, "end")
+        self.fname_to_idx.clear()
+        self.files = []
 
-# ---------------- HTML 处理 ----------------
-def _collect_nodes(soup):
-    """返回 [(node, kind)]，kind: 'text' 或 'attr'"""
-    items = []
-    for tag in soup.find_all(string=True):
-        parent = tag.parent
-        if parent is None:
-            continue
-        if parent.name and parent.name.lower() in SKIP_TAGS:
-            continue
-        items.append((tag, "text"))
-
-    for el in soup.find_all(True):
-        if el.name and el.name.lower() in SKIP_TAGS:
-            continue
-        for attr in TRANSLATE_ATTRS:
-            if el.has_attr(attr) and isinstance(el[attr], str) and el[attr].strip():
-                items.append((el, ("attr", attr)))
-    return items
-
-
-def _process_one_file(path, client, src_lang, dst_lang, model, batch_size, src_scripts):
-    """翻译单个 HTML 文件，返回翻译后的 HTML 字符串"""
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        html = f.read()
-
-    soup = BeautifulSoup(html, "lxml")
-    nodes = _collect_nodes(soup)
-
-    # 收集需要翻译的文本
-    texts = []
-    for node, kind in nodes:
-        if kind == "text":
-            s = str(node)
-            if not _should_skip(s, src_scripts):
-                texts.append(s)
-        else:
-            _, attr = kind
-            s = node[attr]
-            if not _should_skip(s, src_scripts):
-                texts.append(s)
-
-    # 分批
-    result_map = {}
-    for i in range(0, len(texts), batch_size):
-        chunk = texts[i:i + batch_size]
-        m = _translate_batch(client, chunk, src_lang, dst_lang, model, src_scripts)
-        result_map.update(m)
-
-    # 回写
-    for node, kind in nodes:
-        if kind == "text":
-            s = str(node)
-            if s in result_map:
-                node.replace_with(result_map[s])
-        else:
-            _, attr = kind
-            s = node[attr]
-            if s in result_map:
-                node[attr] = result_map[s]
-
-    return str(soup)
-
-
-# ---------------- 主入口 ----------------
-def run_translation(
-    input_dir,
-    output_dir,
-    api_key,
-    on_progress=None,
-    glossary_path=None,
-    stop_flag=None,
-    only_files=None,
-    src_lang="俄语",
-    dst_lang="简体中文",
-    model="deepseek-chat",
-    batch_size=DEFAULT_BATCH,
-    workers=DEFAULT_WORKERS,
-    base_url="https://api.deepseek.com",
-    skip_existing=True,
-):
-    """
-    批量翻译 input_dir 下的 HTML 到 output_dir。
-
-    on_progress 回调：
-      - 日志： on_progress("文本")
-      - 进度： on_progress(cur, total, filename)
-    """
-
-    def log(msg):
-        if on_progress:
-            try:
-                on_progress(msg)
-            except Exception:
-                pass
-
-    def prog(cur, total, name):
-        if on_progress:
-            try:
-                on_progress(cur, total, name)
-            except Exception:
-                pass
-
-    # 重置统计
-    with _stats_lock:
-        for k in STATS:
-            STATS[k] = 0
-
-    os.makedirs(output_dir, exist_ok=True)
-    os.makedirs(CACHE_DIR, exist_ok=True)
-
-    # 确定源语言脚本（用于跳过无源语言字符）
-    src_scripts = ()
-    if src_lang in LANGUAGES:
-        src_scripts = LANGUAGES[src_lang][1]
-    else:
-        log(f"⚠ 「{src_lang}」不在内置语言表，跳过字符检测（所有片段都发 API）")
-
-    if glossary_path:
-        log(f"术语表已配置：{glossary_path}（当前引擎暂未启用，预留接口）")
-
-    # 收集文件
-    if only_files:
-        files = [f for f in only_files if os.path.isfile(f)]
-    else:
-        files = []
-        for name in sorted(os.listdir(input_dir)):
-            if name.lower().endswith((".html", ".htm")):
-                files.append(os.path.join(input_dir, name))
-
-    if not files:
-        log("没有找到 HTML 文件")
-        return
-
-    total = len(files)
-    log(f"共 {total} 个文件，开始翻译（{src_lang} -> {dst_lang}）")
-
-    client = OpenAI(api_key=api_key, base_url=base_url)
-
-    # 跳过未改动文件
-    tasks = []
-    for path in files:
-        name = os.path.basename(path)
-        out_path = os.path.join(output_dir, name)
-        if skip_existing and os.path.exists(out_path):
-            if os.path.getmtime(out_path) >= os.path.getmtime(path):
-                log(f"跳过（未改动）：{name}")
-                continue
-        tasks.append((path, out_path))
-
-    if not tasks:
-        log("所有文件都已翻译且未改动，无需处理")
-        prog(total, total, "完成")
-        return
-
-    log(f"实际待翻译 {len(tasks)} 个文件")
-
-    done = 0
-    done_lock = threading.Lock()
-    stop = stop_flag
-
-    def worker(path, out_path):
-        nonlocal done
-        if stop is not None and stop.is_set():
+        d = self.var_in.get().strip()
+        if not os.path.isdir(d):
+            self.lb_count.config(text="(0) 目录不存在")
             return
-        name = os.path.basename(path)
-        try:
-            log(f"开始：{name}")
-            new_html = _process_one_file(
-                path, client, src_lang, dst_lang, model, batch_size, src_scripts)
-            with open(out_path, "w", encoding="utf-8") as f:
-                f.write(new_html)
-            log(f"完成：{name}")
-        except Exception as e:
-            log(f"失败：{name} —— {e}")
-        finally:
-            with done_lock:
-                done += 1
-                prog(done, len(tasks), name)
 
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = [ex.submit(worker, p, o) for p, o in tasks]
-        for _ in as_completed(futures):
+        names = [n for n in os.listdir(d) if n.lower().endswith((".html", ".htm"))]
+        names.sort(key=str.lower)
+
+        for i, name in enumerate(names):
+            self.lb.insert("end", name)
+            self.fname_to_idx[name] = i
+        self.files = names
+        self.lb_count.config(text=f"({len(names)})")
+
+    def _mark_file(self, fname, state):
+        idx = self.fname_to_idx.get(os.path.basename(fname))
+        if idx is None:
+            return
+        try:
+            if state == "doing":
+                self.lb.itemconfig(idx, background=COLOR_DOING_BG, foreground=COLOR_DOING_FG)
+                self.lb.see(idx)
+            elif state == "done":
+                self.lb.itemconfig(idx, background="", foreground=COLOR_DONE_FG)
+            elif state == "fail":
+                self.lb.itemconfig(idx, background="", foreground=COLOR_FAIL_FG)
+        except tk.TclError:
             pass
 
-    # 汇总
-    log("—— 统计 ——")
-    log(f"缓存命中：{STATS['cache_hit']} 段")
-    log(f"实际调用：{STATS['api_call']} 段")
-    log(f"翻译字符：{STATS['translated_chars']}")
-    log(f"节省字符：{STATS['saved_chars']}")
-    log("全部结束")
+    # ---------- 交互 ----------
+    def _on_double_click(self, event):
+        """双击左侧文件 → 弹窗确认 → 只翻这个文件。"""
+        if self.worker and self.worker.is_alive():
+            messagebox.showinfo("提示", "正在翻译中，等它跑完或先点【停止】。")
+            return
+
+        sel = self.lb.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        fname = self.lb.get(idx)
+        in_dir = self.var_in.get().strip()
+        full_path = os.path.join(in_dir, fname)
+        if not os.path.isfile(full_path):
+            messagebox.showwarning("提示", "文件不存在，先点【刷新】。")
+            return
+
+        ok = messagebox.askyesno(
+            "单文件翻译",
+            f"只翻译这一个文件吗？\n\n"
+            f"文件：{fname}\n"
+            f"源语言：{self.var_src.get()}\n"
+            f"目标语言：{self.var_dst.get()}\n\n"
+            f"（其它文件不会被处理）"
+        )
+        if not ok:
+            return
+
+        self._start_single(fname)
+
+    def _choose_dir(self, var):
+        d = filedialog.askdirectory(initialdir=var.get() or os.getcwd())
+        if d:
+            var.set(d)
+            if var is self.var_in:
+                self._refresh_file_list()
+
+    def _choose_file(self):
+        f = filedialog.askopenfilename(
+            initialdir=os.path.dirname(self.var_glossary.get() or os.getcwd()),
+            filetypes=[("文本", "*.txt"), ("所有文件", "*.*")])
+        if f:
+            self.var_glossary.set(f)
+
+    def _open_output(self):
+        d = self.var_out.get().strip()
+        if os.path.isdir(d):
+            os.startfile(d)
+        else:
+            messagebox.showinfo("提示", "输出目录不存在。")
+
+    # ---------- 配置持久化 ----------
+    def _load_config(self):
+        if not os.path.isfile(CONFIG_PATH):
+            return
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            self.var_api.set(cfg.get("api_key", ""))
+            self.var_in.set(cfg.get("input", self.var_in.get()))
+            self.var_out.set(cfg.get("output", self.var_out.get()))
+            self.var_cache.set(cfg.get("cache", self.var_cache.get()))
+            self.var_src.set(cfg.get("src", self.var_src.get()))
+            self.var_dst.set(cfg.get("dst", self.var_dst.get()))
+            self.var_glossary.set(cfg.get("glossary", ""))
+            self.var_batch.set(str(cfg.get("batch", self.var_batch.get())))
+            self.var_workers.set(str(cfg.get("workers", self.var_workers.get())))
+        except Exception as e:
+            print("读取配置失败：", e)
+
+    def _save_config(self):
+        cfg = {
+            "api_key": self.var_api.get().strip(),
+            "input": self.var_in.get().strip(),
+            "output": self.var_out.get().strip(),
+            "cache": self.var_cache.get().strip(),
+            "src": self.var_src.get(),
+            "dst": self.var_dst.get(),
+            "glossary": self.var_glossary.get().strip(),
+            "batch": self.var_batch.get().strip(),
+            "workers": self.var_workers.get().strip(),
+        }
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        self._log("配置已保存到 gui_config.json")
+
+    # ---------- 日志 ----------
+    def _log(self, msg):
+        self.txt.configure(state="normal")
+        self.txt.insert("end", msg + "\n")
+        self.txt.see("end")
+        self.txt.configure(state="disabled")
+
+    # ---------- 启动：全部 ----------
+    def _start_all(self):
+        if not self._precheck():
+            return
+        try:
+            batch = int(self.var_batch.get())
+            workers = int(self.var_workers.get())
+        except ValueError:
+            messagebox.showwarning("提示", "批大小/并发数必须是整数")
+            return
+
+        self.single_mode = False
+        self.single_target = None
+        self._refresh_file_list()
+        self._begin_run()
+        in_dir = self.var_in.get().strip()
+
+        self.worker = threading.Thread(
+            target=self._worker_batch,
+            args=(in_dir, self.var_out.get().strip(), self.var_cache.get().strip(),
+                  self.var_api.get().strip(), self.var_src.get(), self.var_dst.get(),
+                  self.var_glossary.get().strip(), batch, workers),
+            daemon=True)
+        self.worker.start()
+
+    # ---------- 启动：单个 ----------
+    def _start_single(self, fname):
+        if not self._precheck():
+            return
+        try:
+            batch = int(self.var_batch.get())
+            workers = int(self.var_workers.get())
+        except ValueError:
+            messagebox.showwarning("提示", "批大小/并发数必须是整数")
+            return
+
+        self.single_mode = True
+        self.single_target = fname
+        self._begin_run()
+        # 单文件模式：只把这一行的颜色重置，其它保持
+        self._mark_file(fname, "doing")
+
+        in_dir = self.var_in.get().strip()
+        out_dir = self.var_out.get().strip()
+        cache_dir = self.var_cache.get().strip()
+
+        self.worker = threading.Thread(
+            target=self._worker_single,
+            args=(in_dir, out_dir, cache_dir,
+                  self.var_api.get().strip(), self.var_src.get(), self.var_dst.get(),
+                  self.var_glossary.get().strip(), batch, workers, fname),
+            daemon=True)
+        self.worker.start()
+
+    def _precheck(self):
+        if self.worker and self.worker.is_alive():
+            messagebox.showinfo("提示", "已经在翻译中。")
+            return False
+        if not self.var_api.get().strip():
+            messagebox.showwarning("提示", "请填写 API Key")
+            return False
+        if not os.path.isdir(self.var_in.get().strip()):
+            messagebox.showwarning("提示", "输入目录不存在")
+            return False
+        # 语言对检查
+        if self.var_src.get() == self.var_dst.get():
+            r = messagebox.askyesno("提示", "源语言与目标语言相同，确定继续？")
+            if not r:
+                return False
+        return True
+
+    def _begin_run(self):
+        self.stop_flag.clear()
+        self.var_file.set(0.0)
+        self.var_frag.set(0.0)
+        self.var_status.set("运行中…")
+        self.btn_start.config(state="disabled")
+        self.btn_stop.config(state="normal")
+        # 重置所有项颜色
+        for i in range(self.lb.size()):
+            self.lb.itemconfig(i, background="", foreground="")
+
+    def _stop(self):
+        self.stop_flag.set()
+        self.var_status.set("正在停止…")
+        self._log(">> 已发送停止信号，等待当前批次结束…")
+
+    # ---------- 后台线程：批量 ----------
+    def _worker_batch(self, in_dir, out_dir, cache_dir, api, src, dst, glossary, batch, workers):
+        def on_file(done, total, name):
+            self.msg_q.put(("file", (done, total, name)))
+
+        def on_frag(done, total, name):
+            self.msg_q.put(("frag", (done, total)))
+
+        def log_cb(msg):
+            self.msg_q.put(("log", msg))
+
+        try:
+            th.run_translation(
+                input_dir=in_dir,
+                output_dir=out_dir,
+                cache_dir=cache_dir,
+                api_key=api,
+                src_lang=src,
+                dst_lang=dst,
+                glossary_path=glossary if glossary else None,
+                batch_size=batch,
+                workers=workers,
+                on_file=on_file,
+                on_fragment=on_frag,
+                log_cb=log_cb,
+                stop_flag=self.stop_flag,
+            )
+            self.msg_q.put(("done", None))
+        except Exception as e:
+            import traceback
+            self.msg_q.put(("error", f"{e}\n{traceback.format_exc()}"))
+
+    # ---------- 后台线程：单个 ----------
+    def _worker_single(self, in_dir, out_dir, cache_dir, api, src, dst, glossary,
+                       batch, workers, fname):
+        """只翻一个文件：临时目录隔离，跑完把结果搬回输出目录。"""
+        tmp_root = None
+        try:
+            tmp_root = tempfile.mkdtemp(prefix="single_html_")
+            tmp_in = os.path.join(tmp_root, "input")
+            tmp_out = os.path.join(tmp_root, "output")
+            os.makedirs(tmp_in, exist_ok=True)
+            os.makedirs(tmp_out, exist_ok=True)
+
+            src_path = os.path.join(in_dir, fname)
+            dst_in = os.path.join(tmp_in, fname)
+            shutil.copy2(src_path, dst_in)
+
+            def on_file(done, total, name):
+                # 把自己映射回原文件名，让左侧列表能高亮
+                self.msg_q.put(("file", (done, total, fname)))
+
+            def on_frag(done, total, name):
+                self.msg_q.put(("frag", (done, total)))
+
+            def log_cb(msg):
+                self.msg_q.put(("log", msg))
+
+            self.msg_q.put(("log", f">> 单文件模式：{fname}"))
+
+            th.run_translation(
+                input_dir=tmp_in,
+                output_dir=tmp_out,
+                cache_dir=cache_dir,          # 复用同一个 cache，省钱
+                api_key=api,
+                src_lang=src,
+                dst_lang=dst,
+                glossary_path=glossary if glossary else None,
+                batch_size=batch,
+                workers=workers,
+                on_file=on_file,
+                on_fragment=on_frag,
+                log_cb=log_cb,
+                stop_flag=self.stop_flag,
+            )
+
+            # 把结果搬回原输出目录
+            produced = os.path.join(tmp_out, fname)
+            if not os.path.isfile(produced):
+                # 有些实现输出文件名可能变过，兜底找一下
+                candidates = [n for n in os.listdir(tmp_out)
+                              if n.lower().endswith((".html", ".htm"))]
+                if candidates:
+                    produced = os.path.join(tmp_out, candidates[0])
+
+            if os.path.isfile(produced):
+                os.makedirs(out_dir, exist_ok=True)
+                final_dst = os.path.join(out_dir, fname)
+                shutil.copy2(produced, final_dst)
+                self.msg_q.put(("log", f">> 已输出：{final_dst}"))
+            else:
+                self.msg_q.put(("error", "单文件翻译未生成输出文件。"))
+
+            self.msg_q.put(("done_single", fname))
+        except Exception as e:
+            import traceback
+            self.msg_q.put(("error", f"{e}\n{traceback.format_exc()}"))
+        finally:
+            if tmp_root and os.path.isdir(tmp_root):
+                try:
+                    shutil.rmtree(tmp_root, ignore_errors=True)
+                except Exception:
+                    pass
+
+    # ---------- 队列轮询 ----------
+    def _poll_queue(self):
+        try:
+            while True:
+                kind, data = self.msg_q.get_nowait()
+                if kind == "log":
+                    self._log(data)
+                elif kind == "file":
+                    done, total, name = data
+                    if total > 0:
+                        self.var_file.set(done * 100.0 / total)
+                    self._mark_doing_by_progress(name)
+                    self.var_status.set(f"文件 {done}/{total}  {os.path.basename(name)}")
+                elif kind == "frag":
+                    done, total = data
+                    if total > 0:
+                        self.var_frag.set(done * 100.0 / total)
+                elif kind == "file_doing":
+                    self._mark_file(data, "doing")
+                elif kind == "file_done":
+                    self._mark_file(data, "done")
+                elif kind == "file_fail":
+                    self._mark_file(data, "fail")
+                elif kind == "done":
+                    self.var_status.set("完成 ✅")
+                    self.var_file.set(100.0)
+                    self.var_frag.set(100.0)
+                    self.btn_start.config(state="normal")
+                    self.btn_stop.config(state="disabled")
+                    self._log("== 全部完成 ==")
+                    messagebox.showinfo("完成", "批量翻译完成，去输出目录看看。")
+                elif kind == "done_single":
+                    fname = data
+                    self.var_status.set(f"单文件完成 ✅  {fname}")
+                    self.var_file.set(100.0)
+                    self.var_frag.set(100.0)
+                    self.btn_start.config(state="normal")
+                    self.btn_stop.config(state="disabled")
+                    self._mark_file(fname, "done")
+                    self._log(f"== 单文件完成：{fname} ==")
+                    messagebox.showinfo("完成", f"已翻译：{fname}\n去输出目录看看。")
+                elif kind == "error":
+                    self.var_status.set("出错 ❌")
+                    self.btn_start.config(state="normal")
+                    self.btn_stop.config(state="disabled")
+                    if self.single_mode and self.single_target:
+                        self._mark_file(self.single_target, "fail")
+                    self._log("!!! 出错：\n" + str(data))
+                    messagebox.showerror("出错", str(data)[:1000])
+        except queue.Empty:
+            pass
+        self.root.after(120, self._poll_queue)
+
+    def _mark_doing_by_progress(self, current_name):
+        base = os.path.basename(current_name)
+        for i in range(self.lb.size()):
+            try:
+                txt = self.lb.get(i)
+            except tk.TclError:
+                continue
+            if txt != base and self.lb.itemcget(i, "background") == COLOR_DOING_BG:
+                self.lb.itemconfig(i, background="", foreground="")
+        self._mark_file(base, "doing")
+
+
+def main():
+    root = tk.Tk()
+    try:
+        style = ttk.Style()
+        style.theme_use("vista")
+    except Exception:
+        pass
+    App(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
