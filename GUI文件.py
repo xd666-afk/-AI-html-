@@ -1,584 +1,704 @@
 # -*- coding: utf-8 -*-
 """
-GUI文件.py —— DeepSeek API 批量翻译 HTML（tkinter 桌面版）
-与 translate_html.py 必须放在同一目录下。
-
-功能：
-- 批量翻译整个 input 目录
-- 左侧文件列表，双击某个文件可"只翻译这一个"（弹窗确认）
-- 双进度条（文件级 + 片段级）
-- 术语表、语言选择、缓存、批大小/并发数
+HTML 批量翻译 - GUI 前端
+依赖同目录的 translate_html.py（真实接口，位置参数）
 """
 
 import os
 import sys
 import json
 import shutil
-import queue
-import tempfile
 import threading
+import queue
+import time
+import traceback
+
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-# 保证可以从同目录导入核心模块
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import translate_html as th
 
 
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gui_config.json")
+# ---------- 路径 ----------
+def _get_base_dir():
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
 
-# 颜色 / 状态
+
+BASE_DIR = _get_base_dir()
+CONFIG_PATH = os.path.join(BASE_DIR, "gui_config.json")
+CACHE_DIR = os.path.join(BASE_DIR, "cache")
+
+# ---------- 颜色 ----------
 COLOR_DOING_BG = "#D6E9FF"
 COLOR_DOING_FG = "#0B4C9E"
-COLOR_DONE_FG  = "#888888"
-COLOR_FAIL_FG  = "#C0392B"
-COLOR_SKIP_FG  = "#AAAAAA"
+COLOR_DONE_FG = "#888888"
+COLOR_FAIL_FG = "#C0392B"
+
+# ---------- 语言（显示名 -> code） ----------
+LANG_DISPLAY = [
+    ("自动检测", "auto"),
+    ("简体中文", "zh-CN"),
+    ("英语", "en"),
+    ("俄语", "ru"),
+    ("日语", "ja"),
+    ("韩语", "ko"),
+    ("法语", "fr"),
+    ("德语", "de"),
+    ("西班牙语", "es"),
+    ("葡萄牙语", "pt"),
+    ("意大利语", "it"),
+    ("阿拉伯语", "ar"),
+    ("泰语", "th"),
+]
+
+DISPLAY_TO_CODE = {d: c for d, c in LANG_DISPLAY}
+CODE_TO_DISPLAY = {c: d for d, c in LANG_DISPLAY}
+
+DEFAULT_CONFIG = {
+    "api_key": "",
+    "input": "",
+    "output": "",
+    "src_lang": "auto",
+    "dst_lang": "zh-CN",
+    "skip_existing": True,
+    "batch_size": th.DEFAULT_BATCH,
+    "workers": th.DEFAULT_WORKERS,
+    "glossary": "",
+}
 
 
 class App:
     def __init__(self, root):
         self.root = root
         self.root.title("HTML 批量翻译（DeepSeek）")
-        self.root.geometry("1060x660")
+        self.root.geometry("980x720")
+        self.root.minsize(860, 600)
 
-        # 状态
+        # 运行状态
         self.worker = None
         self.stop_flag = threading.Event()
         self.msg_q = queue.Queue()
-        self.fname_to_idx = {}   # 文件名 -> Listbox 行号
-        self.files = []          # 当前列表中的文件名（顺序）
-        self.single_mode = False # 是否单文件模式
-        self.single_target = None  # 单文件模式下正在翻的原文件名（用于显示）
+        self.running = False
+        self.single_mode = False
+        self.current_file_index = None
+        self.file_rows = []
+        self._list_start_time = 0.0
 
-        # 变量
-        base = os.path.dirname(os.path.abspath(__file__))
-        self.var_in  = tk.StringVar(value=os.path.join(base, "input"))
-        self.var_out = tk.StringVar(value=os.path.join(base, "output"))
-        self.var_cache = tk.StringVar(value=os.path.join(base, "cache"))
-        self.var_api = tk.StringVar(value="")
-        self.var_src = tk.StringVar(value="英语")
-        self.var_dst = tk.StringVar(value="简体中文")
-        self.var_glossary = tk.StringVar(value="")
-        self.var_batch = tk.StringVar(value=str(th.DEFAULT_BATCH))
-        self.var_workers = tk.StringVar(value=str(th.DEFAULT_WORKERS))
-        self.var_file = tk.DoubleVar(value=0.0)
-        self.var_frag = tk.DoubleVar(value=0.0)
-        self.var_status = tk.StringVar(value="就绪")
+        # 进度条节流用
+        self._last_frag_shown = -1
+        self._last_batch_shown = -1
+        self._cur_frag_file = None
 
+        # 配置
+        self.cfg = dict(DEFAULT_CONFIG)
         self._load_config()
+
+        # 界面
         self._build_ui()
-        self._refresh_file_list()
+
+        # 队列轮询
         self.root.after(120, self._poll_queue)
 
-    # ---------- UI ----------
-    def _build_ui(self):
-        pad = {"padx": 6, "pady": 4}
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        main = ttk.Frame(self.root)
-        main.pack(fill="both", expand=True, padx=8, pady=6)
+    # ------------------------------------------------------------
+    def _build_ui(self):
+        # ===== 顶部：API Key =====
+        top = ttk.Frame(self.root, padding=(10, 8, 10, 0))
+        top.pack(fill="x")
+
+        ttk.Label(top, text="API Key：").pack(side="left")
+        self.var_api_key = tk.StringVar(value=self.cfg.get("api_key", ""))
+        self.entry_api_key = ttk.Entry(top, textvariable=self.var_api_key, show="*")
+        self.entry_api_key.pack(side="left", fill="x", expand=True, padx=(0, 6))
+
+        self.var_show_key = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            top, text="显示", variable=self.var_show_key,
+            command=self._toggle_key_show
+        ).pack(side="left")
+
+        # ===== 目录行（输入 / 输出） =====
+        dirf = ttk.Frame(self.root, padding=(10, 6, 10, 0))
+        dirf.pack(fill="x")
+        dirf.columnconfigure(1, weight=1)
+
+        ttk.Label(dirf, text="输入目录：").grid(row=0, column=0, sticky="w")
+        self.var_input = tk.StringVar(value=self.cfg.get("input", ""))
+        ttk.Entry(dirf, textvariable=self.var_input).grid(row=0, column=1, sticky="ew", padx=6)
+        ttk.Button(dirf, text="浏览…", command=self._choose_input).grid(row=0, column=2)
+
+        ttk.Label(dirf, text="输出目录：").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.var_output = tk.StringVar(value=self.cfg.get("output", ""))
+        ttk.Entry(dirf, textvariable=self.var_output).grid(row=1, column=1, sticky="ew", padx=6, pady=(6, 0))
+        ttk.Button(dirf, text="浏览…", command=self._choose_output).grid(row=1, column=2, pady=(6, 0))
+
+        ttk.Label(dirf, text="术语表：").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        self.var_glossary = tk.StringVar(value=self.cfg.get("glossary", ""))
+        ttk.Entry(dirf, textvariable=self.var_glossary).grid(row=2, column=1, sticky="ew", padx=6, pady=(6, 0))
+        ttk.Button(dirf, text="浏览…", command=self._choose_glossary).grid(row=2, column=2, pady=(6, 0))
+
+        # ===== 参数行 =====
+        pf = ttk.Frame(self.root, padding=(10, 6, 10, 0))
+        pf.pack(fill="x")
+
+        ttk.Label(pf, text="源语言：").pack(side="left")
+        self.var_src = tk.StringVar(value=CODE_TO_DISPLAY.get(self.cfg.get("src_lang", "auto"), "自动检测"))
+        self.cmb_src = ttk.Combobox(
+            pf, textvariable=self.var_src, state="readonly", width=10,
+            values=[d for d, _ in LANG_DISPLAY]
+        )
+        self.cmb_src.pack(side="left", padx=(0, 12))
+
+        ttk.Label(pf, text="目标语言：").pack(side="left")
+        self.var_dst = tk.StringVar(value=CODE_TO_DISPLAY.get(self.cfg.get("dst_lang", "zh-CN"), "简体中文"))
+        self.cmb_dst = ttk.Combobox(
+            pf, textvariable=self.var_dst, state="readonly", width=10,
+            values=[d for d, _ in LANG_DISPLAY]
+        )
+        self.cmb_dst.pack(side="left", padx=(0, 12))
+
+        ttk.Label(pf, text="批量：").pack(side="left")
+        self.var_batch = tk.IntVar(value=int(self.cfg.get("batch_size", th.DEFAULT_BATCH)))
+        ttk.Spinbox(pf, from_=1, to=200, textvariable=self.var_batch, width=5).pack(side="left", padx=(0, 12))
+
+        ttk.Label(pf, text="并发：").pack(side="left")
+        self.var_workers = tk.IntVar(value=int(self.cfg.get("workers", th.DEFAULT_WORKERS)))
+        ttk.Spinbox(pf, from_=1, to=64, textvariable=self.var_workers, width=5).pack(side="left", padx=(0, 12))
+
+        self.var_skip = tk.BooleanVar(value=bool(self.cfg.get("skip_existing", True)))
+        ttk.Checkbutton(pf, text="跳过已存在", variable=self.var_skip).pack(side="left", padx=(0, 12))
+
+        # ===== 按钮行 =====
+        bf = ttk.Frame(self.root, padding=(10, 8, 10, 0))
+        bf.pack(fill="x")
+
+        self.btn_start = ttk.Button(bf, text="▶ 开始翻译", command=self._on_start)
+        self.btn_start.pack(side="left")
+
+        self.btn_stop = ttk.Button(bf, text="■ 停止", command=self._on_stop, state="disabled")
+        self.btn_stop.pack(side="left", padx=(8, 0))
+
+        self.btn_clear = ttk.Button(bf, text="清空日志", command=self._clear_log)
+        self.btn_clear.pack(side="left", padx=(8, 0))
+
+        self.lbl_status = ttk.Label(bf, text="空闲")
+        self.lbl_status.pack(side="right")
+
+        # ===== 进度条 =====
+        pgf = ttk.Frame(self.root, padding=(10, 8, 10, 0))
+        pgf.pack(fill="x")
+        pgf.columnconfigure(1, weight=1)
+
+        ttk.Label(pgf, text="文件：").grid(row=0, column=0, sticky="w")
+        self.pb_file = ttk.Progressbar(pgf, mode="determinate", maximum=1000)
+        self.pb_file.grid(row=0, column=1, sticky="ew", padx=6, pady=2)
+        self.lbl_pb_file = ttk.Label(pgf, text="0/0", width=16)
+        self.lbl_pb_file.grid(row=0, column=2, sticky="e")
+
+        ttk.Label(pgf, text="片段：").grid(row=1, column=0, sticky="w")
+        self.pb_frag = ttk.Progressbar(pgf, mode="determinate", maximum=1000)
+        self.pb_frag.grid(row=1, column=1, sticky="ew", padx=6, pady=2)
+        self.lbl_pb_frag = ttk.Label(pgf, text="0/0", width=16)
+        self.lbl_pb_frag.grid(row=1, column=2, sticky="e")
+
+        ttk.Label(pgf, text="批次：").grid(row=2, column=0, sticky="w")
+        self.pb_batch = ttk.Progressbar(pgf, mode="determinate", maximum=1000)
+        self.pb_batch.grid(row=2, column=1, sticky="ew", padx=6, pady=2)
+        self.lbl_pb_batch = ttk.Label(pgf, text="0/0", width=16)
+        self.lbl_pb_batch.grid(row=2, column=2, sticky="e")
+
+        # ===== 主体：左文件列表 / 右日志 =====
+        body = ttk.Frame(self.root, padding=(10, 8, 10, 10))
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=0)
+        body.columnconfigure(1, weight=1)
+        body.rowconfigure(0, weight=1)
 
         # 左：文件列表
-        left = ttk.LabelFrame(main, text="待翻译文件 (input) —— 双击可单独翻译")
-        left.pack(side="left", fill="both", expand=False, padx=(0, 8))
+        lf = ttk.LabelFrame(body, text="文件（双击单文件翻译）", padding=4)
+        lf.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        lf.rowconfigure(0, weight=1)
+        lf.columnconfigure(0, weight=1)
 
-        header = ttk.Frame(left)
-        header.pack(fill="x", padx=6, pady=(4, 2))
-        self.lb_count = ttk.Label(header, text="(0)")
-        self.lb_count.pack(side="left")
-        ttk.Button(header, text="刷新", width=6, command=self._refresh_file_list).pack(side="right")
+        self.lst = tk.Listbox(lf, width=42, activestyle="none")
+        self.lst.grid(row=0, column=0, sticky="nsew")
+        sb1 = ttk.Scrollbar(lf, orient="vertical", command=self.lst.yview)
+        sb1.grid(row=0, column=1, sticky="ns")
+        self.lst.config(yscrollcommand=sb1.set)
+        self.lst.bind("<Double-Button-1>", self._on_double_click)
 
-        lb_wrap = ttk.Frame(left)
-        lb_wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
-        sb = ttk.Scrollbar(lb_wrap, orient="vertical")
-        self.lb = tk.Listbox(lb_wrap, width=36, height=30, activestyle="none",
-                             yscrollcommand=sb.set)
-        sb.config(command=self.lb.yview)
-        sb.pack(side="right", fill="y")
-        self.lb.pack(side="left", fill="both", expand=True)
+        # 右：日志
+        rf = ttk.LabelFrame(body, text="日志", padding=4)
+        rf.grid(row=0, column=1, sticky="nsew")
+        rf.rowconfigure(0, weight=1)
+        rf.columnconfigure(0, weight=1)
 
-        # 双击 = 只翻这个文件
-        self.lb.bind("<Double-Button-1>", self._on_double_click)
+        self.txt = tk.Text(rf, wrap="word", state="disabled", height=10)
+        self.txt.grid(row=0, column=0, sticky="nsew")
+        sb2 = ttk.Scrollbar(rf, orient="vertical", command=self.txt.yview)
+        sb2.grid(row=0, column=1, sticky="ns")
+        self.txt.config(yscrollcommand=sb2.set)
+        self.txt.tag_config("err", foreground=COLOR_FAIL_FG)
+        self.txt.tag_config("ok", foreground="#1E7A34")
+        self.txt.tag_config("dim", foreground="#666666")
 
-        # 右：配置 + 日志
-        right = ttk.Frame(main)
-        right.pack(side="left", fill="both", expand=True)
-
-        # ----- 配置区 -----
-        cfg = ttk.LabelFrame(right, text="配置")
-        cfg.pack(fill="x")
-        cfg.columnconfigure(1, weight=1)
-
-        r = 0
-        ttk.Label(cfg, text="输入目录").grid(row=r, column=0, sticky="w", **pad)
-        ttk.Entry(cfg, textvariable=self.var_in).grid(row=r, column=1, sticky="ew", **pad)
-        ttk.Button(cfg, text="选择", width=6,
-                   command=lambda: self._choose_dir(self.var_in)).grid(row=r, column=2, **pad)
-
-        r += 1
-        ttk.Label(cfg, text="输出目录").grid(row=r, column=0, sticky="w", **pad)
-        ttk.Entry(cfg, textvariable=self.var_out).grid(row=r, column=1, sticky="ew", **pad)
-        ttk.Button(cfg, text="选择", width=6,
-                   command=lambda: self._choose_dir(self.var_out)).grid(row=r, column=2, **pad)
-
-        r += 1
-        ttk.Label(cfg, text="缓存目录").grid(row=r, column=0, sticky="w", **pad)
-        ttk.Entry(cfg, textvariable=self.var_cache).grid(row=r, column=1, sticky="ew", **pad)
-        ttk.Button(cfg, text="选择", width=6,
-                   command=lambda: self._choose_dir(self.var_cache)).grid(row=r, column=2, **pad)
-
-        r += 1
-        ttk.Label(cfg, text="API Key").grid(row=r, column=0, sticky="w", **pad)
-        ttk.Entry(cfg, textvariable=self.var_api, show="*").grid(row=r, column=1, sticky="ew", **pad)
-        ttk.Button(cfg, text="保存配置", width=8, command=self._save_config).grid(row=r, column=2, **pad)
-
-        r += 1
-        ttk.Label(cfg, text="源语言").grid(row=r, column=0, sticky="w", **pad)
-        lang_values = list(th.LANGUAGES.keys())
-        self.cb_src = ttk.Combobox(cfg, textvariable=self.var_src, values=lang_values,
-                                   state="readonly", width=18)
-        self.cb_src.grid(row=r, column=1, sticky="w", **pad)
-
-        ttk.Label(cfg, text="目标语言").grid(row=r, column=2, sticky="w", **pad)
-        self.cb_dst = ttk.Combobox(cfg, textvariable=self.var_dst, values=lang_values,
-                                   state="readonly", width=18)
-        self.cb_dst.grid(row=r, column=3, sticky="w", **pad)
-
-        r += 1
-        ttk.Label(cfg, text="术语表").grid(row=r, column=0, sticky="w", **pad)
-        ttk.Entry(cfg, textvariable=self.var_glossary).grid(row=r, column=1, sticky="ew", **pad)
-        ttk.Button(cfg, text="选择", width=6,
-                   command=self._choose_file).grid(row=r, column=2, **pad)
-
-        r += 1
-        ttk.Label(cfg, text="批大小").grid(row=r, column=0, sticky="w", **pad)
-        ttk.Entry(cfg, textvariable=self.var_batch, width=8).grid(row=r, column=1, sticky="w", **pad)
-        ttk.Label(cfg, text="并发数").grid(row=r, column=2, sticky="w", **pad)
-        ttk.Entry(cfg, textvariable=self.var_workers, width=8).grid(row=r, column=3, sticky="w", **pad)
-
-        # ----- 按钮 -----
-        bar = ttk.Frame(right)
-        bar.pack(fill="x", pady=(6, 4))
-        self.btn_start = ttk.Button(bar, text="开始翻译（全部）", command=self._start_all)
-        self.btn_start.pack(side="left", padx=4)
-        self.btn_stop = ttk.Button(bar, text="停止", command=self._stop, state="disabled")
-        self.btn_stop.pack(side="left", padx=4)
-        ttk.Button(bar, text="打开输出目录", command=self._open_output).pack(side="left", padx=4)
-
-        # ----- 双进度条 -----
-        prog = ttk.LabelFrame(right, text="进度")
-        prog.pack(fill="x", pady=(0, 4))
-        ttk.Label(prog, text="文件").grid(row=0, column=0, sticky="w", padx=6, pady=2)
-        ttk.Progressbar(prog, variable=self.var_file, maximum=100.0).grid(
-            row=0, column=1, sticky="ew", padx=6, pady=2)
-        ttk.Label(prog, text="片段").grid(row=1, column=0, sticky="w", padx=6, pady=2)
-        ttk.Progressbar(prog, variable=self.var_frag, maximum=100.0).grid(
-            row=1, column=1, sticky="ew", padx=6, pady=2)
-        prog.columnconfigure(1, weight=1)
-        ttk.Label(prog, textvariable=self.var_status).grid(
-            row=2, column=0, columnspan=2, sticky="w", padx=6, pady=(2, 4))
-
-        # ----- 日志 -----
-        logf = ttk.LabelFrame(right, text="日志")
-        logf.pack(fill="both", expand=True)
-        self.txt = tk.Text(logf, height=12, wrap="word", state="disabled")
-        lsb = ttk.Scrollbar(logf, orient="vertical", command=self.txt.yview)
-        self.txt.configure(yscrollcommand=lsb.set)
-        lsb.pack(side="right", fill="y")
-        self.txt.pack(side="left", fill="both", expand=True)
-
-        self._log("就绪。填好 API Key，点【开始翻译（全部）】批量翻，")
-        self._log("或在左侧列表【双击】某个文件，只翻这一个。")
-
-    # ---------- 文件列表 ----------
-    def _refresh_file_list(self):
-        self.lb.delete(0, "end")
-        self.fname_to_idx.clear()
-        self.files = []
-
-        d = self.var_in.get().strip()
-        if not os.path.isdir(d):
-            self.lb_count.config(text="(0) 目录不存在")
-            return
-
-        names = [n for n in os.listdir(d) if n.lower().endswith((".html", ".htm"))]
-        names.sort(key=str.lower)
-
-        for i, name in enumerate(names):
-            self.lb.insert("end", name)
-            self.fname_to_idx[name] = i
-        self.files = names
-        self.lb_count.config(text=f"({len(names)})")
-
-    def _mark_file(self, fname, state):
-        idx = self.fname_to_idx.get(os.path.basename(fname))
-        if idx is None:
-            return
-        try:
-            if state == "doing":
-                self.lb.itemconfig(idx, background=COLOR_DOING_BG, foreground=COLOR_DOING_FG)
-                self.lb.see(idx)
-            elif state == "done":
-                self.lb.itemconfig(idx, background="", foreground=COLOR_DONE_FG)
-            elif state == "fail":
-                self.lb.itemconfig(idx, background="", foreground=COLOR_FAIL_FG)
-        except tk.TclError:
-            pass
-
-    # ---------- 交互 ----------
-    def _on_double_click(self, event):
-        """双击左侧文件 → 弹窗确认 → 只翻这个文件。"""
-        if self.worker and self.worker.is_alive():
-            messagebox.showinfo("提示", "正在翻译中，等它跑完或先点【停止】。")
-            return
-
-        sel = self.lb.curselection()
-        if not sel:
-            return
-        idx = sel[0]
-        fname = self.lb.get(idx)
-        in_dir = self.var_in.get().strip()
-        full_path = os.path.join(in_dir, fname)
-        if not os.path.isfile(full_path):
-            messagebox.showwarning("提示", "文件不存在，先点【刷新】。")
-            return
-
-        ok = messagebox.askyesno(
-            "单文件翻译",
-            f"只翻译这一个文件吗？\n\n"
-            f"文件：{fname}\n"
-            f"源语言：{self.var_src.get()}\n"
-            f"目标语言：{self.var_dst.get()}\n\n"
-            f"（其它文件不会被处理）"
-        )
-        if not ok:
-            return
-
-        self._start_single(fname)
-
-    def _choose_dir(self, var):
-        d = filedialog.askdirectory(initialdir=var.get() or os.getcwd())
-        if d:
-            var.set(d)
-            if var is self.var_in:
-                self._refresh_file_list()
-
-    def _choose_file(self):
-        f = filedialog.askopenfilename(
-            initialdir=os.path.dirname(self.var_glossary.get() or os.getcwd()),
-            filetypes=[("文本", "*.txt"), ("所有文件", "*.*")])
-        if f:
-            self.var_glossary.set(f)
-
-    def _open_output(self):
-        d = self.var_out.get().strip()
-        if os.path.isdir(d):
-            os.startfile(d)
-        else:
-            messagebox.showinfo("提示", "输出目录不存在。")
-
-    # ---------- 配置持久化 ----------
+    # ============================================================
+    # 配置
+    # ============================================================
     def _load_config(self):
-        if not os.path.isfile(CONFIG_PATH):
+        if not os.path.exists(CONFIG_PATH):
             return
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-            self.var_api.set(cfg.get("api_key", ""))
-            self.var_in.set(cfg.get("input", self.var_in.get()))
-            self.var_out.set(cfg.get("output", self.var_out.get()))
-            self.var_cache.set(cfg.get("cache", self.var_cache.get()))
-            self.var_src.set(cfg.get("src", self.var_src.get()))
-            self.var_dst.set(cfg.get("dst", self.var_dst.get()))
-            self.var_glossary.set(cfg.get("glossary", ""))
-            self.var_batch.set(str(cfg.get("batch", self.var_batch.get())))
-            self.var_workers.set(str(cfg.get("workers", self.var_workers.get())))
+                data = json.load(f)
+            if isinstance(data, dict):
+                for k in DEFAULT_CONFIG:
+                    if k in data:
+                        self.cfg[k] = data[k]
         except Exception as e:
-            print("读取配置失败：", e)
+            print("读取配置失败:", e)
 
     def _save_config(self):
-        cfg = {
-            "api_key": self.var_api.get().strip(),
-            "input": self.var_in.get().strip(),
-            "output": self.var_out.get().strip(),
-            "cache": self.var_cache.get().strip(),
-            "src": self.var_src.get(),
-            "dst": self.var_dst.get(),
+        data = {
+            "api_key": self.var_api_key.get().strip(),
+            "input": self.var_input.get().strip(),
+            "output": self.var_output.get().strip(),
+            "src_lang": DISPLAY_TO_CODE.get(self.var_src.get(), "auto"),
+            "dst_lang": DISPLAY_TO_CODE.get(self.var_dst.get(), "zh-CN"),
+            "skip_existing": bool(self.var_skip.get()),
+            "batch_size": int(self.var_batch.get()),
+            "workers": int(self.var_workers.get()),
             "glossary": self.var_glossary.get().strip(),
-            "batch": self.var_batch.get().strip(),
-            "workers": self.var_workers.get().strip(),
         }
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
-        self._log("配置已保存到 gui_config.json")
+        try:
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            self._log(f"保存配置失败：{e}", "err")
 
-    # ---------- 日志 ----------
-    def _log(self, msg):
-        self.txt.configure(state="normal")
-        self.txt.insert("end", msg + "\n")
+    # ============================================================
+    # 输入控件
+    # ============================================================
+    def _toggle_key_show(self):
+        self.entry_api_key.config(show="" if self.var_show_key.get() else "*")
+
+    def _choose_input(self):
+        d = filedialog.askdirectory(title="选择输入目录")
+        if d:
+            self.var_input.set(d)
+
+    def _choose_output(self):
+        d = filedialog.askdirectory(title="选择输出目录")
+        if d:
+            self.var_output.set(d)
+
+    def _choose_glossary(self):
+        p = filedialog.askopenfilename(
+            title="选择术语表",
+            filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")]
+        )
+        if p:
+            self.var_glossary.set(p)
+
+    # ============================================================
+    # 日志 / 进度条
+    # ============================================================
+    def _log(self, msg, tag=None):
+        ts = time.strftime("%H:%M:%S")
+        line = f"[{ts}] {msg}\n"
+        self.txt.config(state="normal")
+        self.txt.insert("end", line, tag or ())
         self.txt.see("end")
-        self.txt.configure(state="disabled")
+        self.txt.config(state="disabled")
 
-    # ---------- 启动：全部 ----------
-    def _start_all(self):
-        if not self._precheck():
+    def _clear_log(self):
+        self.txt.config(state="normal")
+        self.txt.delete("1.0", "end")
+        self.txt.config(state="disabled")
+
+    def _set_progress(self, bar, lbl, done, total):
+        total = max(int(total or 0), 0)
+        done = max(int(done or 0), 0)
+        if total <= 0:
+            bar["maximum"] = 1000
+            bar["value"] = 0
+            lbl.config(text="0/0")
             return
+        if done > total:
+            done = total
+        pct = done * 100.0 / total
+        bar["maximum"] = 1000
+        bar["value"] = int(pct * 10)   # 0 ~ 1000
+        lbl.config(text=f"{done}/{total} ({pct:.0f}%)")
+
+    def _reset_progress(self):
+        self._last_frag_shown = -1
+        self._last_batch_shown = -1
+        self._cur_frag_file = None
+        for bar, lbl in ((self.pb_file, self.lbl_pb_file),
+                         (self.pb_frag, self.lbl_pb_frag),
+                         (self.pb_batch, self.lbl_pb_batch)):
+            bar["maximum"] = 1000
+            bar["value"] = 0
+            lbl.config(text="0/0")
+
+    # ============================================================
+    # 文件列表
+    # ============================================================
+    def _scan_files(self, in_dir):
+        out = []
+        if not in_dir or not os.path.isdir(in_dir):
+            return out
+        for name in sorted(os.listdir(in_dir)):
+            if name.lower().endswith((".html", ".htm")):
+                p = os.path.join(in_dir, name)
+                if os.path.isfile(p):
+                    out.append(name)
+        return out
+
+    def _refresh_file_list(self):
+        self.lst.delete(0, "end")
+        self.file_rows = []
+        names = self._scan_files(self.var_input.get().strip())
+        for n in names:
+            self.lst.insert("end", n)
+            self.file_rows.append(n)
+        self._list_start_time = time.time()
+
+    def _find_row(self, fname):
         try:
-            batch = int(self.var_batch.get())
-            workers = int(self.var_workers.get())
+            return self.file_rows.index(fname)
         except ValueError:
-            messagebox.showwarning("提示", "批大小/并发数必须是整数")
+            return -1
+
+    def _mark_row(self, idx, kind):
+        if idx is None or idx < 0 or idx >= self.lst.size():
             return
+        if kind == "doing":
+            self.lst.itemconfig(idx, background=COLOR_DOING_BG, foreground=COLOR_DOING_FG)
+        elif kind == "done":
+            self.lst.itemconfig(idx, background="", foreground=COLOR_DONE_FG)
+        elif kind == "fail":
+            self.lst.itemconfig(idx, background="", foreground=COLOR_FAIL_FG)
+        elif kind == "reset":
+            self.lst.itemconfig(idx, background="", foreground="")
 
-        self.single_mode = False
-        self.single_target = None
-        self._refresh_file_list()
-        self._begin_run()
-        in_dir = self.var_in.get().strip()
-
-        self.worker = threading.Thread(
-            target=self._worker_batch,
-            args=(in_dir, self.var_out.get().strip(), self.var_cache.get().strip(),
-                  self.var_api.get().strip(), self.var_src.get(), self.var_dst.get(),
-                  self.var_glossary.get().strip(), batch, workers),
-            daemon=True)
-        self.worker.start()
-
-    # ---------- 启动：单个 ----------
-    def _start_single(self, fname):
-        if not self._precheck():
-            return
-        try:
-            batch = int(self.var_batch.get())
-            workers = int(self.var_workers.get())
-        except ValueError:
-            messagebox.showwarning("提示", "批大小/并发数必须是整数")
-            return
-
-        self.single_mode = True
-        self.single_target = fname
-        self._begin_run()
-        # 单文件模式：只把这一行的颜色重置，其它保持
-        self._mark_file(fname, "doing")
-
-        in_dir = self.var_in.get().strip()
-        out_dir = self.var_out.get().strip()
-        cache_dir = self.var_cache.get().strip()
-
-        self.worker = threading.Thread(
-            target=self._worker_single,
-            args=(in_dir, out_dir, cache_dir,
-                  self.var_api.get().strip(), self.var_src.get(), self.var_dst.get(),
-                  self.var_glossary.get().strip(), batch, workers, fname),
-            daemon=True)
-        self.worker.start()
-
-    def _precheck(self):
-        if self.worker and self.worker.is_alive():
-            messagebox.showinfo("提示", "已经在翻译中。")
-            return False
-        if not self.var_api.get().strip():
-            messagebox.showwarning("提示", "请填写 API Key")
-            return False
-        if not os.path.isdir(self.var_in.get().strip()):
-            messagebox.showwarning("提示", "输入目录不存在")
-            return False
-        # 语言对检查
-        if self.var_src.get() == self.var_dst.get():
-            r = messagebox.askyesno("提示", "源语言与目标语言相同，确定继续？")
-            if not r:
-                return False
-        return True
-
-    def _begin_run(self):
-        self.stop_flag.clear()
-        self.var_file.set(0.0)
-        self.var_frag.set(0.0)
-        self.var_status.set("运行中…")
-        self.btn_start.config(state="disabled")
-        self.btn_stop.config(state="normal")
-        # 重置所有项颜色
-        for i in range(self.lb.size()):
-            self.lb.itemconfig(i, background="", foreground="")
-
-    def _stop(self):
-        self.stop_flag.set()
-        self.var_status.set("正在停止…")
-        self._log(">> 已发送停止信号，等待当前批次结束…")
-
-    # ---------- 后台线程：批量 ----------
-    def _worker_batch(self, in_dir, out_dir, cache_dir, api, src, dst, glossary, batch, workers):
-        def on_file(done, total, name):
-            self.msg_q.put(("file", (done, total, name)))
-
-        def on_frag(done, total, name):
-            self.msg_q.put(("frag", (done, total)))
-
-        def log_cb(msg):
-            self.msg_q.put(("log", msg))
-
-        try:
-            th.run_translation(
-                input_dir=in_dir,
-                output_dir=out_dir,
-                cache_dir=cache_dir,
-                api_key=api,
-                src_lang=src,
-                dst_lang=dst,
-                glossary_path=glossary if glossary else None,
-                batch_size=batch,
-                workers=workers,
-                on_file=on_file,
-                on_fragment=on_frag,
-                log_cb=log_cb,
-                stop_flag=self.stop_flag,
-            )
-            self.msg_q.put(("done", None))
-        except Exception as e:
-            import traceback
-            self.msg_q.put(("error", f"{e}\n{traceback.format_exc()}"))
-
-    # ---------- 后台线程：单个 ----------
-    def _worker_single(self, in_dir, out_dir, cache_dir, api, src, dst, glossary,
-                       batch, workers, fname):
-        """只翻一个文件：临时目录隔离，跑完把结果搬回输出目录。"""
-        tmp_root = None
-        try:
-            tmp_root = tempfile.mkdtemp(prefix="single_html_")
-            tmp_in = os.path.join(tmp_root, "input")
-            tmp_out = os.path.join(tmp_root, "output")
-            os.makedirs(tmp_in, exist_ok=True)
-            os.makedirs(tmp_out, exist_ok=True)
-
-            src_path = os.path.join(in_dir, fname)
-            dst_in = os.path.join(tmp_in, fname)
-            shutil.copy2(src_path, dst_in)
-
-            def on_file(done, total, name):
-                # 把自己映射回原文件名，让左侧列表能高亮
-                self.msg_q.put(("file", (done, total, fname)))
-
-            def on_frag(done, total, name):
-                self.msg_q.put(("frag", (done, total)))
-
-            def log_cb(msg):
-                self.msg_q.put(("log", msg))
-
-            self.msg_q.put(("log", f">> 单文件模式：{fname}"))
-
-            th.run_translation(
-                input_dir=tmp_in,
-                output_dir=tmp_out,
-                cache_dir=cache_dir,          # 复用同一个 cache，省钱
-                api_key=api,
-                src_lang=src,
-                dst_lang=dst,
-                glossary_path=glossary if glossary else None,
-                batch_size=batch,
-                workers=workers,
-                on_file=on_file,
-                on_fragment=on_frag,
-                log_cb=log_cb,
-                stop_flag=self.stop_flag,
-            )
-
-            # 把结果搬回原输出目录
-            produced = os.path.join(tmp_out, fname)
-            if not os.path.isfile(produced):
-                # 有些实现输出文件名可能变过，兜底找一下
-                candidates = [n for n in os.listdir(tmp_out)
-                              if n.lower().endswith((".html", ".htm"))]
-                if candidates:
-                    produced = os.path.join(tmp_out, candidates[0])
-
-            if os.path.isfile(produced):
-                os.makedirs(out_dir, exist_ok=True)
-                final_dst = os.path.join(out_dir, fname)
-                shutil.copy2(produced, final_dst)
-                self.msg_q.put(("log", f">> 已输出：{final_dst}"))
-            else:
-                self.msg_q.put(("error", "单文件翻译未生成输出文件。"))
-
-            self.msg_q.put(("done_single", fname))
-        except Exception as e:
-            import traceback
-            self.msg_q.put(("error", f"{e}\n{traceback.format_exc()}"))
-        finally:
-            if tmp_root and os.path.isdir(tmp_root):
-                try:
-                    shutil.rmtree(tmp_root, ignore_errors=True)
-                except Exception:
-                    pass
-
-    # ---------- 队列轮询 ----------
+    # ============================================================
+    # 队列轮询
+    # ============================================================
     def _poll_queue(self):
+        n = 0
         try:
-            while True:
-                kind, data = self.msg_q.get_nowait()
-                if kind == "log":
-                    self._log(data)
-                elif kind == "file":
-                    done, total, name = data
-                    if total > 0:
-                        self.var_file.set(done * 100.0 / total)
-                    self._mark_doing_by_progress(name)
-                    self.var_status.set(f"文件 {done}/{total}  {os.path.basename(name)}")
-                elif kind == "frag":
-                    done, total = data
-                    if total > 0:
-                        self.var_frag.set(done * 100.0 / total)
-                elif kind == "file_doing":
-                    self._mark_file(data, "doing")
-                elif kind == "file_done":
-                    self._mark_file(data, "done")
-                elif kind == "file_fail":
-                    self._mark_file(data, "fail")
-                elif kind == "done":
-                    self.var_status.set("完成 ✅")
-                    self.var_file.set(100.0)
-                    self.var_frag.set(100.0)
-                    self.btn_start.config(state="normal")
-                    self.btn_stop.config(state="disabled")
-                    self._log("== 全部完成 ==")
-                    messagebox.showinfo("完成", "批量翻译完成，去输出目录看看。")
-                elif kind == "done_single":
-                    fname = data
-                    self.var_status.set(f"单文件完成 ✅  {fname}")
-                    self.var_file.set(100.0)
-                    self.var_frag.set(100.0)
-                    self.btn_start.config(state="normal")
-                    self.btn_stop.config(state="disabled")
-                    self._mark_file(fname, "done")
-                    self._log(f"== 单文件完成：{fname} ==")
-                    messagebox.showinfo("完成", f"已翻译：{fname}\n去输出目录看看。")
-                elif kind == "error":
-                    self.var_status.set("出错 ❌")
-                    self.btn_start.config(state="normal")
-                    self.btn_stop.config(state="disabled")
-                    if self.single_mode and self.single_target:
-                        self._mark_file(self.single_target, "fail")
-                    self._log("!!! 出错：\n" + str(data))
-                    messagebox.showerror("出错", str(data)[:1000])
+            while n < 300:
+                msg = self.msg_q.get_nowait()
+                self._handle_msg(msg)
+                n += 1
         except queue.Empty:
             pass
         self.root.after(120, self._poll_queue)
 
-    def _mark_doing_by_progress(self, current_name):
-        base = os.path.basename(current_name)
-        for i in range(self.lb.size()):
-            try:
-                txt = self.lb.get(i)
-            except tk.TclError:
-                continue
-            if txt != base and self.lb.itemcget(i, "background") == COLOR_DOING_BG:
-                self.lb.itemconfig(i, background="", foreground="")
-        self._mark_file(base, "doing")
+    def _handle_msg(self, msg):
+        kind = msg.get("kind")
+
+        if kind == "log":
+            self._log(msg.get("text", ""), msg.get("tag"))
+
+        elif kind == "file":
+            done = msg.get("done", 0)
+            total = msg.get("total", 0)
+            self._set_progress(self.pb_file, self.lbl_pb_file, done, total)
+            self.lbl_status.config(text=f"文件 {done}/{total}")
+
+        elif kind == "frag":
+            done = msg.get("done", 0)
+            total = msg.get("total", 0)
+            name = msg.get("name", "")
+
+            # 换文件了 → 重置片段进度条
+            if name and name != self._cur_frag_file:
+                self._cur_frag_file = name
+                self._last_frag_shown = -1
+                self.pb_frag["maximum"] = 1000
+                self.pb_frag["value"] = 0
+                self.lbl_pb_frag.config(text="0/0")
+
+            if total <= 0:
+                self.pb_frag["maximum"] = 1000
+                self.pb_frag["value"] = 0
+                self.lbl_pb_frag.config(text="0/0")
+                return
+
+            step = max(1, total // 100)
+            if done >= total or done - self._last_frag_shown >= step:
+                self._last_frag_shown = done
+                pct = done * 100.0 / total
+                self.pb_frag["maximum"] = 1000
+                self.pb_frag["value"] = int(pct * 10)
+                self.lbl_pb_frag.config(text=f"{done}/{total} ({pct:.0f}%)")
+
+        elif kind == "batch":
+            done = msg.get("done", 0)
+            total = msg.get("total", 0)
+            self._set_progress(self.pb_batch, self.lbl_pb_batch, done, total)
+
+        elif kind == "file_doing":
+            idx = self._find_row(msg.get("name", ""))
+            self._mark_row(idx, "doing")
+            if idx >= 0:
+                self.lst.see(idx)
+
+        elif kind == "file_done":
+            idx = self._find_row(msg.get("name", ""))
+            self._mark_row(idx, "done")
+
+        elif kind == "file_fail":
+            idx = self._find_row(msg.get("name", ""))
+            self._mark_row(idx, "fail")
+
+        elif kind == "done":
+            self._on_finished(single=False)
+            return
+
+        elif kind == "done_single":
+            self._on_finished(single=True)
+            return
+
+        elif kind == "error":
+            self._log(msg.get("text", "未知错误"), "err")
+            self._on_finished(single=msg.get("single", False))
+            return
+
+    # ============================================================
+    # 启动 / 停止
+    # ============================================================
+    def _collect_params(self):
+        api_key = self.var_api_key.get().strip()
+        in_dir = self.var_input.get().strip()
+        out_dir = self.var_output.get().strip()
+        glossary = self.var_glossary.get().strip()
+
+        if not api_key:
+            messagebox.showwarning("提示", "请填写 API Key")
+            return None
+        if not in_dir or not os.path.isdir(in_dir):
+            messagebox.showwarning("提示", "输入目录无效")
+            return None
+        if not out_dir:
+            messagebox.showwarning("提示", "请选择输出目录")
+            return None
+
+        src_code = DISPLAY_TO_CODE.get(self.var_src.get(), "auto")
+        dst_code = DISPLAY_TO_CODE.get(self.var_dst.get(), "zh-CN")
+        if dst_code == "auto":
+            messagebox.showwarning("提示", "目标语言不能是“自动检测”")
+            return None
+
+        try:
+            batch_size = int(self.var_batch.get())
+            workers = int(self.var_workers.get())
+        except Exception:
+            messagebox.showwarning("提示", "批量 / 并发必须是整数")
+            return None
+
+        os.makedirs(out_dir, exist_ok=True)
+        os.makedirs(CACHE_DIR, exist_ok=True)
+
+        return {
+            "api_key": api_key,
+            "in_dir": in_dir,
+            "out_dir": out_dir,
+            "src_code": src_code,
+            "dst_code": dst_code,
+            "glossary": glossary if glossary and os.path.isfile(glossary) else None,
+            "batch_size": batch_size,
+            "workers": workers,
+        }
+
+    def _on_start(self):
+        if self.running:
+            return
+        params = self._collect_params()
+        if not params:
+            return
+
+        self._save_config()
+        self._refresh_file_list()
+
+        if not self.file_rows:
+            messagebox.showinfo("提示", "输入目录里没有 .html / .htm 文件")
+            return
+
+        self.running = True
+        self.single_mode = False
+        self.stop_flag = threading.Event()
+        self.btn_start.config(state="disabled")
+        self.btn_stop.config(state="normal")
+        self._reset_progress()
+        self.lbl_status.config(text="准备中…")
+
+        self.worker = threading.Thread(
+            target=self._worker_batch, args=(params,), daemon=True
+        )
+        self.worker.start()
+
+    def _on_double_click(self, _evt):
+        if self.running:
+            messagebox.showinfo("提示", "正在运行中，请先停止")
+            return
+        sel = self.lst.curselection()
+        if not sel:
+            return
+        fname = self.file_rows[sel[0]]
+        params = self._collect_params()
+        if not params:
+            return
+
+        self._save_config()
+        if self.lst.size() == 0:
+            self._refresh_file_list()
+
+        self.running = True
+        self.single_mode = True
+        self.stop_flag = threading.Event()
+        self.btn_start.config(state="disabled")
+        self.btn_stop.config(state="normal")
+        self._reset_progress()
+        self.lbl_status.config(text=f"单文件：{fname}")
+
+        self.worker = threading.Thread(
+            target=self._worker_single, args=(params, fname), daemon=True
+        )
+        self.worker.start()
+
+    def _on_stop(self):
+        if not self.running:
+            return
+        self.stop_flag.set()
+        self.lbl_status.config(text="正在停止…")
+        self._log("已请求停止，等待当前批次结束…", "dim")
+
+    def _on_finished(self, single=False):
+        self.running = False
+        self.btn_start.config(state="normal")
+        self.btn_stop.config(state="disabled")
+        self.lbl_status.config(text="空闲" if not single else "空闲（单文件完成）")
+
+    # ============================================================
+    # 回调（在 worker 线程里执行，只往队列塞消息）
+    # ============================================================
+    def _cb_log(self, text):
+        try:
+            self.msg_q.put({"kind": "log", "text": str(text)})
+        except Exception:
+            pass
+
+    def _cb_file(self, total, done, fname):
+        self.msg_q.put({"kind": "file", "total": total, "done": done, "name": fname})
+
+    def _cb_frag(self, total, done, fname):
+        self.msg_q.put({"kind": "frag", "total": total, "done": done, "name": fname})
+
+    def _cb_batch(self, done, total):
+        self.msg_q.put({"kind": "batch", "total": total, "done": done})
+
+    # ============================================================
+    # worker：批量
+    # ============================================================
+    def _worker_batch(self, p):
+        try:
+            self._cb_log("开始批量翻译…")
+
+            th.run_translation(
+                p["in_dir"],
+                p["out_dir"],
+                CACHE_DIR,
+                p["api_key"],
+                p["src_code"],
+                p["dst_code"],
+                p["glossary"],
+                p["batch_size"],
+                p["workers"],
+                on_file=self._cb_file,
+                on_fragment=self._cb_frag,
+                on_batch=self._cb_batch,
+                log_cb=self._cb_log,
+                stop_flag=self.stop_flag,
+            )
+            self.msg_q.put({"kind": "done", "single": False})
+        except Exception as e:
+            self.msg_q.put({
+                "kind": "error",
+                "text": f"运行出错：{e}\n{traceback.format_exc()}",
+                "single": False,
+            })
+
+    # ============================================================
+    # worker：单文件
+    # ============================================================
+    def _worker_single(self, p, fname):
+        tmp_in = None
+        try:
+            self.msg_q.put({"kind": "file_doing", "name": fname})
+            self.msg_q.put({"kind": "file", "total": 1, "done": 0, "name": fname})
+
+            tmp_in = os.path.join(CACHE_DIR, "_single_in")
+            if os.path.isdir(tmp_in):
+                shutil.rmtree(tmp_in, ignore_errors=True)
+            os.makedirs(tmp_in, exist_ok=True)
+
+            src_path = os.path.join(p["in_dir"], fname)
+            shutil.copy2(src_path, os.path.join(tmp_in, fname))
+
+            th.run_translation(
+                tmp_in,
+                p["out_dir"],
+                CACHE_DIR,
+                p["api_key"],
+                p["src_code"],
+                p["dst_code"],
+                p["glossary"],
+                p["batch_size"],
+                p["workers"],
+                on_file=self._cb_file,
+                on_fragment=self._cb_frag,
+                on_batch=self._cb_batch,
+                log_cb=self._cb_log,
+                stop_flag=self.stop_flag,
+            )
+
+            self.msg_q.put({"kind": "file_done", "name": fname})
+            self.msg_q.put({"kind": "file", "total": 1, "done": 1, "name": fname})
+            self._cb_log(f"单文件完成：{fname}")
+            self.msg_q.put({"kind": "done_single", "single": True})
+        except Exception as e:
+            self.msg_q.put({"kind": "file_fail", "name": fname})
+            self.msg_q.put({
+                "kind": "error",
+                "text": f"单文件出错：{e}\n{traceback.format_exc()}",
+                "single": True,
+            })
+        finally:
+            if tmp_in and os.path.isdir(tmp_in):
+                shutil.rmtree(tmp_in, ignore_errors=True)
+
+    # ============================================================
+    def _on_close(self):
+        if self.running:
+            if not messagebox.askyesno("确认", "任务运行中，确定退出？"):
+                return
+            self.stop_flag.set()
+        self._save_config()
+        self.root.destroy()
 
 
+# ============================================================
 def main():
     root = tk.Tk()
     try:
-        style = ttk.Style()
-        style.theme_use("vista")
+        ttk.Style().theme_use("vista")
     except Exception:
         pass
     App(root)
