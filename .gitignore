@@ -1,0 +1,8 @@
+gui_config.json
+input/
+output/
+cache/
+__pycache__/
+*.py[cod]
+.venv/
+.idea/
